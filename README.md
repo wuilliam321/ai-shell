@@ -9,7 +9,7 @@
 
 ```shell
 git clone https://github.com/wuilliam321/ai-shell.git
-cd go-ai-shell
+cd ai-shell
 go build -o ai
 ```
 
