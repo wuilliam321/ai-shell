@@ -8,7 +8,7 @@
 ## Installation
 
 ```shell
-git clone https://github.com/wuilliam321/go-ai-shell.git
+git clone https://github.com/wuilliam321/ai-shell.git
 cd go-ai-shell
 go build -o ai
 ```
