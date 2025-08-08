@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,7 +17,7 @@ import (
 )
 
 const (
-	proxyURL = "https://api.openai.com/v1/chat/completions"
+	proxyURL = ""
 
 	// System prompts
 	systemPromptStep1 = "You are an expert in command line utilities. Your task is to identify the most appropriate command line tool for a user request. Respond with ONLY the command name, no arguments or flags, just the base command. For example, if asked how to list files, respond with 'ls' only, not 'ls -la'. Do not provide explanations."
@@ -26,8 +28,8 @@ const (
 	prefixStep2 = "Using the following command documentation, provide the best way to use this command for this task: "
 
 	// API settings
-	model       = "gpt-4.1"
-	temperature = 0.2
+	model       = "gpt-5"
+	temperature = 1
 )
 
 // OpenAI API request structure
@@ -59,6 +61,21 @@ type Choice struct {
 	FinishReason string  `json:"finish_reason"`
 }
 
+// HistoryEntry captures a single run for history logging
+type HistoryEntry struct {
+	Timestamp             time.Time `json:"timestamp"`
+	Model                 string    `json:"model"`
+	OS                    OSType    `json:"os"`
+	Query                 string    `json:"query"`
+	IdentifiedCommand     string    `json:"identified_command,omitempty"`
+	CommandPath           string    `json:"command_path,omitempty"`
+	DocumentationIncluded bool      `json:"documentation_included"`
+	GeneratedCommand      string    `json:"generated_command,omitempty"`
+	Action                string    `json:"action"` // run | decline
+	ExitCode              int       `json:"exit_code,omitempty"`
+	Error                 string    `json:"error,omitempty"`
+}
+
 // OSType represents the detected operating system
 type OSType string
 
@@ -76,72 +93,143 @@ type CommandInfo struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("You must provide a command as an argument")
+	// Flags
+	var verbose bool
+	var historyPathFlag string
+	var appendShellHist bool
+	flag.BoolVar(&verbose, "v", false, "enable verbose output")
+	flag.StringVar(&historyPathFlag, "history", "", "path to history log file (default: ~/.go-ai-shell/history.jsonl)")
+	flag.BoolVar(&appendShellHist, "append-shell-history", true, "append accepted command to shell history (bash/zsh)")
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		fmt.Println("Usage: go-ai-shell [-v] [--history path] <request>")
 		return
 	}
 
 	// Detect OS
 	currentOS := detectOS()
-	fmt.Printf("Detected OS: %s\n", currentOS)
+	if verbose {
+		fmt.Printf("OS: %s\n", currentOS)
+	}
 
 	// Get user query
-	args := strings.Join(os.Args[1:], " ")
+	args := strings.Join(flag.Args(), " ")
+
+	// Prepare history entry and destination
+	historyPath := historyPathFlag
+	if historyPath == "" {
+		historyPath = defaultHistoryPath()
+	}
+	history := &HistoryEntry{
+		Timestamp: time.Now().UTC(),
+		Model:     model,
+		OS:        currentOS,
+		Query:     args,
+	}
+	defer func() {
+		if err := appendHistory(historyPath, history); err != nil && verbose {
+			fmt.Printf("Warning: failed to write history: %v\n", err)
+		}
+	}()
 
 	// Step 1: Identify the appropriate command
-	fmt.Println("Step 1: Identifying appropriate command...")
+	if verbose {
+		fmt.Println("Step 1: Identifying appropriate command...")
+	}
 	commandName, err := identifyCommand(args)
 	if err != nil {
-		fmt.Println("Error identifying command:", err)
+		history.Error = fmt.Sprintf("identify: %v", err)
+		fmt.Println("Error:", err)
 		return
 	}
-	fmt.Printf("Identified command: %s\n", commandName)
+	commandName, err = sanitizeCommandName(commandName)
+	if err != nil {
+		history.Error = fmt.Sprintf("sanitize: %v", err)
+		fmt.Println("Error:", err)
+		return
+	}
+	history.IdentifiedCommand = commandName
+	if verbose {
+		fmt.Printf("Identified command: %s\n", commandName)
+	}
 
 	// Step 2: Find command in system directories and get documentation
-	fmt.Printf("Step 2: Locating command and retrieving documentation...\n")
+	if verbose {
+		fmt.Printf("Step 2: Locating command and retrieving documentation...\n")
+	}
 	cmdInfo, err := findCommandInfo(commandName, currentOS)
 	if err != nil {
-		fmt.Printf("Warning: Could not retrieve full command info: %s\n", err)
+		if verbose {
+			fmt.Printf("Warning: Could not retrieve full command info: %s\n", err)
+		}
 		// Continue with command name only
 		cmdInfo = &CommandInfo{Name: commandName}
 	} else {
-		fmt.Printf("Found command at: %s\n", cmdInfo.Path)
-		fmt.Printf("Documentation length: %d characters\n", len(cmdInfo.Documentation))
+		history.CommandPath = cmdInfo.Path
+		if verbose {
+			fmt.Printf("Found command at: %s\n", cmdInfo.Path)
+			fmt.Printf("Documentation length: %d characters\n", len(cmdInfo.Documentation))
+		}
 	}
+	history.DocumentationIncluded = cmdInfo.Documentation != ""
 
 	// Step 3: Get optimal usage with documentation context
-	fmt.Println("Step 3: Determining optimal command usage...")
+	if verbose {
+		fmt.Println("Step 3: Determining optimal command usage...")
+	}
 	command, err := getOptimalCommand(args, cmdInfo)
 	if err != nil {
-		fmt.Println("Error determining optimal command usage:", err)
+		history.Error = fmt.Sprintf("optimize: %v", err)
+		fmt.Println("Error:", err)
 		return
 	}
+	history.GeneratedCommand = command
 
 	// Display and run command
-	fmt.Printf("\nGenerated command:\n%s\n\n", command)
+	fmt.Printf("%s\n", command)
+	fmt.Printf("(model: %s)\n\n", model)
 
 	// Ask user to run the command
 	for {
 		var answer string
-		fmt.Print("Run this command? ([Y]es/[n]o/[r]etry) [Y]: ")
+		fmt.Print("Run this? ([Y]es/[n]o/[r]etry) [Y]: ")
 		fmt.Scanln(&answer)
 
 		switch strings.ToUpper(answer) {
 		case "Y", "S", "":
-			if err := run(command); err != nil {
+			exitCode, err := run(command)
+			history.Action = "run"
+			history.ExitCode = exitCode
+			if err != nil {
+				history.Error = err.Error()
 				fmt.Println("Error:", err)
+			}
+			if appendShellHist {
+				if err := appendToShellHistory(command, currentOS); err != nil && verbose {
+					fmt.Printf("Warning: could not append to shell history: %v\n", err)
+				}
 			}
 			return
 		case "R":
-			fmt.Println("Retrying command generation...")
+			if verbose {
+				fmt.Println("Retrying command generation...")
+			}
 			command, err = getOptimalCommand(args, cmdInfo)
 			if err != nil {
+				history.Error = fmt.Sprintf("retry: %v", err)
 				fmt.Println("Error:", err)
 				return
 			}
-			fmt.Printf("New command: %s\n", command)
+			history.GeneratedCommand = command
+			if verbose {
+				fmt.Printf("New command: %s\n", command)
+			} else {
+				fmt.Printf("%s\n(model: %s)\n", command, model)
+			}
 			continue
 		case "N":
+			history.Action = "decline"
 			return
 		default:
 			fmt.Println("Invalid option, only [Y]es/[n]o/[r]etry are allowed.")
@@ -237,21 +325,10 @@ func detectOS() OSType {
 
 // findCommandInfo locates the command in system directories and gets its documentation
 func findCommandInfo(commandName string, osType OSType) (*CommandInfo, error) {
-	// Define paths to search based on OS
-	paths := []string{"/usr/bin", "/bin", "/usr/local/bin"}
-
-	// Find command path
-	cmdPath := ""
-	for _, path := range paths {
-		fullPath := filepath.Join(path, commandName)
-		if fileExists(fullPath) {
-			cmdPath = fullPath
-			break
-		}
-	}
-
-	if cmdPath == "" {
-		return nil, fmt.Errorf("command '%s' not found in system paths", commandName)
+	// Find command path via PATH
+	cmdPath, err := exec.LookPath(commandName)
+	if err != nil || cmdPath == "" {
+		return nil, fmt.Errorf("command '%s' not found in PATH", commandName)
 	}
 
 	// Get command documentation
@@ -275,34 +352,26 @@ func fileExists(path string) bool {
 
 // getCommandDocumentation gets the documentation for a command
 func getCommandDocumentation(commandName string, osType OSType) (string, error) {
-	var cmd *exec.Cmd
+	// Prefer --help/-h for speed; then fall back to man. Apply timeouts and disable pagers.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Use man for documentation on macOS and Linux
-	cmd = exec.Command("man", commandName)
-
-	// Capture output
-	out, err := cmd.Output()
-	if err != nil {
-		// Try --help as fallback
-		cmd = exec.Command(commandName, "--help")
-		out, err = cmd.Output()
-		if err != nil {
-			// Try -h as another fallback
-			cmd = exec.Command(commandName, "-h")
-			out, err = cmd.Output()
-			if err != nil {
-				return "", fmt.Errorf("could not get documentation for '%s'", commandName)
-			}
-		}
+	tryCmd := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		c := exec.CommandContext(ctx, name, args...)
+		c.Env = append(os.Environ(), "MANPAGER=cat", "PAGER=cat")
+		return c.Output()
 	}
 
-	// Limit documentation size if it's too large
-	doc := string(out)
-	if len(doc) > 4000 {
-		doc = doc[:4000] + "\n[Documentation truncated due to length]\n"
+	if out, err := tryCmd(ctx, commandName, "--help"); err == nil && len(out) > 0 {
+		return limitDocSize(string(out)), nil
 	}
-
-	return doc, nil
+	if out, err := tryCmd(ctx, commandName, "-h"); err == nil && len(out) > 0 {
+		return limitDocSize(string(out)), nil
+	}
+	if out, err := tryCmd(ctx, "man", commandName); err == nil && len(out) > 0 {
+		return limitDocSize(string(out)), nil
+	}
+	return "", fmt.Errorf("could not get documentation for '%s'", commandName)
 }
 
 // getOptimalCommand gets the optimal command usage with documentation context
@@ -327,10 +396,147 @@ func getOptimalCommand(query string, cmdInfo *CommandInfo) (string, error) {
 	return sendRequest(systemPromptStep2, prompt)
 }
 
-func run(command string) error {
+func run(command string) (int, error) {
 	fmt.Printf("Executing: %s\n\n", command)
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if err == nil {
+		return 0, nil
+	}
+	exitCode := -1
+	if ee, ok := err.(*exec.ExitError); ok {
+		exitCode = ee.ExitCode()
+	}
+	return exitCode, err
+}
+
+// sanitizeCommandName ensures we only use a single, safe command token
+func sanitizeCommandName(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("empty command name from model")
+	}
+	s = parts[0]
+	s = strings.Trim(s, "`\"'.,;:()[]{}")
+	for _, r := range s {
+		if !(r == '_' || r == '-' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return "", fmt.Errorf("invalid character in command name: %q", r)
+		}
+	}
+	if s == "" {
+		return "", fmt.Errorf("invalid empty command name")
+	}
+	return s, nil
+}
+
+func defaultHistoryPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "history.jsonl"
+	}
+	return filepath.Join(home, ".go-ai-shell", "history.jsonl")
+}
+
+func appendHistory(path string, entry *HistoryEntry) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func limitDocSize(doc string) string {
+	if len(doc) > 4000 {
+		return doc[:4000] + "\n[Documentation truncated due to length]\n"
+	}
+	return doc
+}
+
+// appendToShellHistory appends a command to the user's shell history if possible (macOS/Linux; bash/zsh)
+func appendToShellHistory(command string, osType OSType) error {
+	// Determine shell from environment; default to zsh on macOS, bash on Linux
+	shell := os.Getenv("SHELL")
+	var shellName string
+	if shell != "" {
+		shellName = filepath.Base(shell)
+	}
+	if shellName == "" {
+		if osType == OSMacOS {
+			shellName = "zsh"
+		} else if osType == OSLinux {
+			shellName = "bash"
+		}
+	}
+
+	switch shellName {
+	case "zsh":
+		return appendToZshHistory(command)
+	case "bash":
+		return appendToBashHistory(command)
+	default:
+		// Unsupported shell; no-op
+		return nil
+	}
+}
+
+func appendToZshHistory(command string) error {
+	// zsh history file with EXTENDED_HISTORY: ': <epoch>:0;<command>'
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return err
+	}
+	histFile := filepath.Join(home, ".zsh_history")
+	// Prefer HISTFILE if set
+	if hf := os.Getenv("HISTFILE"); hf != "" {
+		histFile = hf
+	}
+	line := fmt.Sprintf(": %d:0;%s\n", time.Now().Unix(), command)
+	f, err := os.OpenFile(histFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line); err != nil {
+		return err
+	}
+	return nil
+}
+
+func appendToBashHistory(command string) error {
+	// bash history is plain lines in ~/.bash_history or $HISTFILE
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return err
+	}
+	histFile := filepath.Join(home, ".bash_history")
+	if hf := os.Getenv("HISTFILE"); hf != "" {
+		histFile = hf
+	}
+	f, err := os.OpenFile(histFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(command + "\n"); err != nil {
+		return err
+	}
+	return nil
 }
