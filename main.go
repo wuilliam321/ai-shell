@@ -10,8 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -24,7 +27,9 @@ const (
 	// Prefixes
 	prefixStep1 = "Identify the most appropriate command line tool for this task (command name only): "
 	prefixStep2 = "Using the following command documentation, provide the best way to use this command for this task: "
+)
 
+var (
 	// API settings
 	model       = "gpt-4.1"
 	temperature = 0.2
@@ -76,6 +81,21 @@ type CommandInfo struct {
 }
 
 func main() {
+	// Load environment variables from .env file
+	_ = godotenv.Load()
+
+	// Override model if environment variable is set
+	if envModel := os.Getenv("OPENAI_MODEL"); envModel != "" {
+		model = envModel
+	}
+
+	// Override temperature if environment variable is set
+	if envTemp := os.Getenv("OPENAI_TEMPERATURE"); envTemp != "" {
+		if t, err := strconv.ParseFloat(envTemp, 64); err == nil {
+			temperature = t
+		}
+	}
+
 	if len(os.Args) < 2 {
 		fmt.Println("You must provide a command as an argument")
 		return
