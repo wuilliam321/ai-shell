@@ -12,53 +12,142 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	proxyURL = ""
+	defaultModel = "claude-opus-4-6"
+	hubURL       = "https://genai.melioffice.com/hub/v1/responses"
 
 	// System prompts
-	systemPromptStep1 = "You are an expert in command line utilities. Your task is to identify the most appropriate command line tool for a user request. Respond with ONLY the command name, no arguments or flags, just the base command. For example, if asked how to list files, respond with 'ls' only, not 'ls -la'. Do not provide explanations."
+	systemPromptStep1 = "You are an expert in command line utilities. Your task is to identify the most appropriate command line tool for a user request from the list of available commands on the user's system. You must only suggest commands that appear in the provided list. Respond with ONLY the command name, no arguments or flags, just the base command. For example, if asked how to list files, respond with 'ls' only, not 'ls -la'. Do not provide explanations."
 	systemPromptStep2 = "You are an expert in command line utilities. Based on the command documentation and the user's request, provide the most appropriate command with all necessary options and arguments. Format your response as a single line command without explanations."
 
 	// Prefixes
 	prefixStep1 = "Identify the most appropriate command line tool for this task (command name only): "
 	prefixStep2 = "Using the following command documentation, provide the best way to use this command for this task: "
-
-	// API settings
-	model       = "gpt-5"
-	temperature = 1
 )
 
-// OpenAI API request structure
-type Request struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	Stream      bool      `json:"stream"`
+// Provider abstracts an AI model backend
+type Provider interface {
+	Name() string
+	Model() string
+	SendRequest(systemPrompt, userContent string, tools []Tool) (string, error)
 }
 
-// Message represents a chat message
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+// Tool represents a tool definition (flat format for /hub/v1/responses)
+type Tool struct {
+	Type        string     `json:"type"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Parameters  ToolParams `json:"parameters"`
 }
 
-// OpenAI API response structure
-type Response struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
+// ToolParams defines the parameters schema for a tool
+type ToolParams struct {
+	Type       string                  `json:"type"`
+	Properties map[string]ToolProperty `json:"properties"`
+	Required   []string                `json:"required"`
 }
 
-type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason string  `json:"finish_reason"`
+// ToolProperty defines a single property in a tool's parameters
+type ToolProperty struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+}
+
+// Hub request/response types shared across all providers
+
+type hubRequest struct {
+	Model           string        `json:"model"`
+	Input           string        `json:"input"`
+	Instructions    string        `json:"instructions,omitempty"`
+	Stream          bool          `json:"stream"`
+	Temperature     float64       `json:"temperature,omitempty"`
+	MaxOutputTokens int           `json:"max_output_tokens,omitempty"`
+	Tools           []Tool        `json:"tools,omitempty"`
+	ToolChoice      string        `json:"tool_choice,omitempty"`
+	Reasoning       *hubReasoning `json:"reasoning,omitempty"`
+}
+
+type hubReasoning struct {
+	Effort string `json:"effort"`
+}
+
+type hubResponse struct {
+	Output []hubOutputItem `json:"output"`
+}
+
+type hubOutputItem struct {
+	Type      string       `json:"type"`
+	Content   []hubContent `json:"content,omitempty"`
+	Name      string       `json:"name,omitempty"`
+	Arguments string       `json:"arguments,omitempty"`
+}
+
+type hubContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// sendHubRequest marshals req, POSTs to hubURL, and returns the text or tool-call result
+func sendHubRequest(req hubRequest) (string, error) {
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+	body, err := doHTTPRequest(hubURL, jsonData)
+	if err != nil {
+		return "", err
+	}
+	var resp hubResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("error unmarshalling response: %w, body: %s", err, string(body))
+	}
+	for _, item := range resp.Output {
+		if item.Type == "function_call" {
+			return extractToolCallField(item.Arguments, "command")
+		}
+		if item.Type == "message" && len(item.Content) > 0 {
+			return strings.TrimSpace(item.Content[0].Text), nil
+		}
+	}
+	return "", fmt.Errorf("no usable output in response")
+}
+
+// Tool definitions for structured output
+var identifyCommandTool = Tool{
+	Type:        "function",
+	Name:        "identify_command",
+	Description: "Return the identified command line tool name for the user's request",
+	Parameters: ToolParams{
+		Type: "object",
+		Properties: map[string]ToolProperty{
+			"command": {
+				Type:        "string",
+				Description: "The command name only, e.g. ls, grep, find, docker",
+			},
+		},
+		Required: []string{"command"},
+	},
+}
+
+var generateCommandTool = Tool{
+	Type:        "function",
+	Name:        "generate_command",
+	Description: "Return the complete shell command with all necessary arguments, flags and options",
+	Parameters: ToolParams{
+		Type: "object",
+		Properties: map[string]ToolProperty{
+			"command": {
+				Type:        "string",
+				Description: "The complete command with all arguments and flags, ready to execute",
+			},
+		},
+		Required: []string{"command"},
+	},
 }
 
 // HistoryEntry captures a single run for history logging
@@ -92,25 +181,101 @@ type CommandInfo struct {
 	Documentation string
 }
 
+// providerForModel returns the appropriate provider based on model name
+func providerForModel(model string) Provider {
+	switch {
+	case strings.HasPrefix(model, "claude"):
+		return NewClaudeProvider(model)
+	case strings.HasPrefix(model, "gpt"), strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"):
+		return NewOpenAIProvider(model)
+	case strings.HasPrefix(model, "gemini"):
+		return NewGoogleProvider(model)
+	default:
+		return NewClaudeProvider(model)
+	}
+}
+
+// doHTTPRequest sends a JSON request to the given URL and returns the raw response body
+func doHTTPRequest(url string, jsonData []byte) ([]byte, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: %s, Details: %s", resp.Status, string(bodyBytes))
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// extractToolCallField extracts a string field from tool call JSON arguments
+func extractToolCallField(arguments, field string) (string, error) {
+	var args map[string]string
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return "", fmt.Errorf("failed to parse tool call arguments: %w", err)
+	}
+	val, ok := args[field]
+	if !ok {
+		return "", fmt.Errorf("field %q not found in tool call arguments", field)
+	}
+	return strings.TrimSpace(val), nil
+}
+
 func main() {
 	// Flags
 	var verbose bool
 	var historyPathFlag string
 	var appendShellHist bool
+	var modelFlag string
+	var setDefault string
 	flag.BoolVar(&verbose, "v", false, "enable verbose output")
 	flag.StringVar(&historyPathFlag, "history", "", "path to history log file (default: ~/.go-ai-shell/history.jsonl)")
 	flag.BoolVar(&appendShellHist, "append-shell-history", true, "append accepted command to shell history (bash/zsh)")
+	flag.StringVar(&modelFlag, "model", "", "model to use for this run (overrides saved default)")
+	flag.StringVar(&setDefault, "default", "", "set and persist the default model")
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		fmt.Println("Usage: go-ai-shell [-v] [--history path] <request>")
+	// Handle --default: save and exit
+	if setDefault != "" {
+		if err := saveDefaultModel(setDefault); err != nil {
+			fmt.Printf("Error saving default model: %v\n", err)
+			return
+		}
+		fmt.Printf("Default model set to: %s\n", setDefault)
 		return
 	}
+
+	if flag.NArg() < 1 {
+		fmt.Println("Usage: go-ai-shell [-v] [--model name] [--default name] [--history path] <request>")
+		return
+	}
+
+	// Resolve model: --model flag > saved default > hardcoded default
+	model := modelFlag
+	if model == "" {
+		model = loadDefaultModel()
+	}
+	if model == "" {
+		model = defaultModel
+	}
+
+	// Select provider based on model
+	provider := providerForModel(model)
 
 	// Detect OS
 	currentOS := detectOS()
 	if verbose {
-		fmt.Printf("OS: %s\n", currentOS)
+		fmt.Printf("Provider: %s, Model: %s, OS: %s\n", provider.Name(), provider.Model(), currentOS)
 	}
 
 	// Get user query
@@ -123,7 +288,7 @@ func main() {
 	}
 	history := &HistoryEntry{
 		Timestamp: time.Now().UTC(),
-		Model:     model,
+		Model:     provider.Model(),
 		OS:        currentOS,
 		Query:     args,
 	}
@@ -133,11 +298,17 @@ func main() {
 		}
 	}()
 
+	// Discover available CLI tools from PATH
+	availableCommands := listAvailableCommands()
+	if verbose {
+		fmt.Printf("Found %d available commands in PATH\n", len(availableCommands))
+	}
+
 	// Step 1: Identify the appropriate command
 	if verbose {
 		fmt.Println("Step 1: Identifying appropriate command...")
 	}
-	commandName, err := identifyCommand(args)
+	commandName, err := identifyCommand(provider, args, availableCommands)
 	if err != nil {
 		history.Error = fmt.Sprintf("identify: %v", err)
 		fmt.Println("Error:", err)
@@ -158,12 +329,11 @@ func main() {
 	if verbose {
 		fmt.Printf("Step 2: Locating command and retrieving documentation...\n")
 	}
-	cmdInfo, err := findCommandInfo(commandName, currentOS)
+	cmdInfo, err := findCommandInfo(commandName)
 	if err != nil {
 		if verbose {
 			fmt.Printf("Warning: Could not retrieve full command info: %s\n", err)
 		}
-		// Continue with command name only
 		cmdInfo = &CommandInfo{Name: commandName}
 	} else {
 		history.CommandPath = cmdInfo.Path
@@ -178,7 +348,7 @@ func main() {
 	if verbose {
 		fmt.Println("Step 3: Determining optimal command usage...")
 	}
-	command, err := getOptimalCommand(args, cmdInfo)
+	command, err := getOptimalCommand(provider, args, cmdInfo)
 	if err != nil {
 		history.Error = fmt.Sprintf("optimize: %v", err)
 		fmt.Println("Error:", err)
@@ -188,7 +358,7 @@ func main() {
 
 	// Display and run command
 	fmt.Printf("%s\n", command)
-	fmt.Printf("(model: %s)\n\n", model)
+	fmt.Printf("(model: %s)\n\n", provider.Model())
 
 	// Ask user to run the command
 	for {
@@ -215,7 +385,7 @@ func main() {
 			if verbose {
 				fmt.Println("Retrying command generation...")
 			}
-			command, err = getOptimalCommand(args, cmdInfo)
+			command, err = getOptimalCommand(provider, args, cmdInfo)
 			if err != nil {
 				history.Error = fmt.Sprintf("retry: %v", err)
 				fmt.Println("Error:", err)
@@ -225,7 +395,7 @@ func main() {
 			if verbose {
 				fmt.Printf("New command: %s\n", command)
 			} else {
-				fmt.Printf("%s\n(model: %s)\n", command, model)
+				fmt.Printf("%s\n(model: %s)\n", command, provider.Model())
 			}
 			continue
 		case "N":
@@ -237,77 +407,24 @@ func main() {
 	}
 }
 
-// sendRequest sends a request to the OpenAI API with the given system prompt and user content
-func sendRequest(systemPrompt, userContent string) (string, error) {
-	// Check for API key
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENAI_API_KEY environment variable not set")
-	}
-
-	// Create request body with system prompt and user query
-	reqBody := Request{
-		Model: model,
-		Messages: []Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userContent},
-		},
-		Temperature: temperature,
-		Stream:      false,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	// Create request with appropriate headers
-	req, err := http.NewRequest("POST", proxyURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", err
-	}
-
-	// Set required headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	// Send request with a timeout
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Handle non-200 responses
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error: %s, Details: %s", resp.Status, string(bodyBytes))
-	}
-
-	// Parse response
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var responseData Response
-	if err := json.Unmarshal(body, &responseData); err != nil {
-		return "", fmt.Errorf("error unmarshalling response: %w, Response body: %s", err, string(body))
-	}
-
-	// Check if we have valid choices
-	if len(responseData.Choices) == 0 {
-		return "", fmt.Errorf("no response choices received")
-	}
-
-	// Extract the content from the response
-	return strings.TrimSpace(responseData.Choices[0].Message.Content), nil
+// identifyCommand identifies the appropriate command for the given user query using available system commands
+func identifyCommand(p Provider, query string, availableCommands []string) (string, error) {
+	content := prefixStep1 + query + "\n\nAvailable commands on this system:\n" + strings.Join(availableCommands, ", ")
+	return p.SendRequest(systemPromptStep1, content, []Tool{identifyCommandTool})
 }
 
-// identifyCommand identifies the appropriate command for the given user query
-func identifyCommand(query string) (string, error) {
-	return sendRequest(systemPromptStep1, prefixStep1+query)
+// getOptimalCommand gets the optimal command usage with documentation context
+func getOptimalCommand(p Provider, query string, cmdInfo *CommandInfo) (string, error) {
+	prompt := prefixStep2 + "\n\n"
+	prompt += fmt.Sprintf("Command: %s\n", cmdInfo.Name)
+	if cmdInfo.Path != "" {
+		prompt += fmt.Sprintf("Path: %s\n", cmdInfo.Path)
+	}
+	if cmdInfo.Documentation != "" {
+		prompt += fmt.Sprintf("\nDocumentation:\n%s\n\n", cmdInfo.Documentation)
+	}
+	prompt += fmt.Sprintf("\nUser request: %s\n", query)
+	return p.SendRequest(systemPromptStep2, prompt, []Tool{generateCommandTool})
 }
 
 // detectOS detects the current operating system
@@ -324,15 +441,13 @@ func detectOS() OSType {
 }
 
 // findCommandInfo locates the command in system directories and gets its documentation
-func findCommandInfo(commandName string, osType OSType) (*CommandInfo, error) {
-	// Find command path via PATH
+func findCommandInfo(commandName string) (*CommandInfo, error) {
 	cmdPath, err := exec.LookPath(commandName)
 	if err != nil || cmdPath == "" {
 		return nil, fmt.Errorf("command '%s' not found in PATH", commandName)
 	}
 
-	// Get command documentation
-	doc, err := getCommandDocumentation(commandName, osType)
+	doc, err := getCommandDocumentation(commandName)
 	if err != nil {
 		return &CommandInfo{Name: commandName, Path: cmdPath}, fmt.Errorf("command found but couldn't get documentation: %w", err)
 	}
@@ -344,15 +459,8 @@ func findCommandInfo(commandName string, osType OSType) (*CommandInfo, error) {
 	}, nil
 }
 
-// fileExists checks if a file exists at the given path
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
 // getCommandDocumentation gets the documentation for a command
-func getCommandDocumentation(commandName string, osType OSType) (string, error) {
-	// Prefer --help/-h for speed; then fall back to man. Apply timeouts and disable pagers.
+func getCommandDocumentation(commandName string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -372,28 +480,6 @@ func getCommandDocumentation(commandName string, osType OSType) (string, error) 
 		return limitDocSize(string(out)), nil
 	}
 	return "", fmt.Errorf("could not get documentation for '%s'", commandName)
-}
-
-// getOptimalCommand gets the optimal command usage with documentation context
-func getOptimalCommand(query string, cmdInfo *CommandInfo) (string, error) {
-	// Prepare prompt for second query
-	prompt := prefixStep2 + "\n\n"
-
-	// Add command info to the prompt
-	prompt += fmt.Sprintf("Command: %s\n", cmdInfo.Name)
-	if cmdInfo.Path != "" {
-		prompt += fmt.Sprintf("Path: %s\n", cmdInfo.Path)
-	}
-
-	// Add documentation if available
-	if cmdInfo.Documentation != "" {
-		prompt += fmt.Sprintf("\nDocumentation:\n%s\n\n", cmdInfo.Documentation)
-	}
-
-	// Add original query
-	prompt += fmt.Sprintf("\nUser request: %s\n", query)
-
-	return sendRequest(systemPromptStep2, prompt)
 }
 
 func run(command string) (int, error) {
@@ -435,6 +521,73 @@ func sanitizeCommandName(raw string) (string, error) {
 	return s, nil
 }
 
+// listAvailableCommands returns the names of all executables found in PATH
+func listAvailableCommands() []string {
+	seen := make(map[string]bool)
+	var commands []string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if seen[name] {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			if info.Mode()&0111 != 0 {
+				seen[name] = true
+				commands = append(commands, name)
+			}
+		}
+	}
+	sort.Strings(commands)
+	return commands
+}
+
+type appConfig struct {
+	Model string `json:"model"`
+}
+
+func configPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "config.json"
+	}
+	return filepath.Join(home, ".go-ai-shell", "config.json")
+}
+
+func saveDefaultModel(model string) error {
+	path := configPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(appConfig{Model: model})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func loadDefaultModel() string {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return ""
+	}
+	var cfg appConfig
+	if json.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	return cfg.Model
+}
+
 func defaultHistoryPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -472,7 +625,6 @@ func limitDocSize(doc string) string {
 
 // appendToShellHistory appends a command to the user's shell history if possible (macOS/Linux; bash/zsh)
 func appendToShellHistory(command string, osType OSType) error {
-	// Determine shell from environment; default to zsh on macOS, bash on Linux
 	shell := os.Getenv("SHELL")
 	var shellName string
 	if shell != "" {
@@ -492,19 +644,16 @@ func appendToShellHistory(command string, osType OSType) error {
 	case "bash":
 		return appendToBashHistory(command)
 	default:
-		// Unsupported shell; no-op
 		return nil
 	}
 }
 
 func appendToZshHistory(command string) error {
-	// zsh history file with EXTENDED_HISTORY: ': <epoch>:0;<command>'
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return err
 	}
 	histFile := filepath.Join(home, ".zsh_history")
-	// Prefer HISTFILE if set
 	if hf := os.Getenv("HISTFILE"); hf != "" {
 		histFile = hf
 	}
@@ -521,7 +670,6 @@ func appendToZshHistory(command string) error {
 }
 
 func appendToBashHistory(command string) error {
-	// bash history is plain lines in ~/.bash_history or $HISTFILE
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return err
